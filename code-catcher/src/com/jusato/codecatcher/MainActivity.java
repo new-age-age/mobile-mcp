@@ -79,7 +79,7 @@ public class MainActivity extends Activity {
         TextView help = new TextView(this);
         help.setText("Volume+ ou tecla 353 captura o código (12 dígitos, sem -).\n\n"
                 + "Auto Paste OFF: só copia para o clipboard.\n"
-                + "Auto Paste ON: copia, toca em 配達 → 手入力 → campo 伝票番号を入力 e cola.");
+                + "Auto Paste ON: copia, toca em 配達 → 手入力 → campo 伝票番号を入力, cola + ENTER, espera 1 s e (sem toque na tela) toca em 配完.");
         help.setTextColor(COLOR_GREY);
         help.setTextSize(14f);
         help.setPadding(60, 40, 60, 40);

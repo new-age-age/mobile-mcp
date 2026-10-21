@@ -4,15 +4,21 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.graphics.PixelFormat;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Toast;
 
 import java.util.ArrayList;
@@ -32,12 +38,19 @@ public final class CodeCatcherService extends AccessibilityService {
     static final String TEXT_MANUAL = "手入力";
     static final String TEXT_FIELD = "伝票番号を入力";
     static final String TEXT_FIELD_SHORT = "伝票番号";
+    static final String TEXT_COMPLETE = "配完";
+    static final String TEXT_COMPLETE_LONG = "配達完了";
 
     private static final int STEP_DELIVERY = 1;
     private static final int STEP_MANUAL = 2;
     private static final int STEP_FIELD = 3;
     private static final int STEP_PASTE = 4;
     private static final int STEP_VERIFY = 5;
+    private static final int STEP_WAIT = 6;
+    private static final int STEP_COMPLETE = 7;
+
+    // AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER (API 30+).
+    private static final int ACTION_IME_ENTER = 0x01020054;
 
     private static final long POLL_MS = 150;
     private static final long AFTER_CLICK_MS = 400;
@@ -65,22 +78,23 @@ public final class CodeCatcherService extends AccessibilityService {
         }
     }
 
-    static final class FinishRunnable implements Runnable {
+    static final class TouchWatcher implements View.OnTouchListener {
         private final CodeCatcherService service;
-        private final String code;
 
-        FinishRunnable(CodeCatcherService service, String code) {
+        TouchWatcher(CodeCatcherService service) {
             this.service = service;
-            this.code = code;
         }
 
         @Override
-        public void run() {
-            service.finishFlow(code);
+        public boolean onTouch(View v, MotionEvent event) {
+            service.userTouched = true;
+            return false;
         }
     }
 
     private boolean flowRunning;
+    boolean userTouched;
+    private View touchView;
     private int step;
     private int attempts;
     private String pendingCode;
@@ -189,6 +203,7 @@ public final class CodeCatcherService extends AccessibilityService {
     private void cancelFlow() {
         // Also drops a pending FinishRunnable so it can't end a newer flow.
         handler.removeCallbacksAndMessages(null);
+        removeTouchWatcher();
         flowRunning = false;
         step = 0;
         attempts = 0;
@@ -207,6 +222,7 @@ public final class CodeCatcherService extends AccessibilityService {
             switch (step) {
                 case STEP_DELIVERY: what = TEXT_DELIVERY; break;
                 case STEP_MANUAL: what = TEXT_MANUAL; break;
+                case STEP_COMPLETE: what = TEXT_COMPLETE; break;
                 default: what = TEXT_FIELD; break;
             }
             cancelFlow();
@@ -220,6 +236,15 @@ public final class CodeCatcherService extends AccessibilityService {
         if (!flowRunning) {
             return;
         }
+        try {
+            doStep();
+        } catch (Exception e) {
+            cancelFlow();
+            showToast("Auto paste erro: " + e);
+        }
+    }
+
+    private void doStep() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
             retry();
@@ -268,26 +293,47 @@ public final class CodeCatcherService extends AccessibilityService {
             }
             case STEP_VERIFY: {
                 AccessibilityNodeInfo target = findPasteTarget(root);
-                if (target != null && !containsCode(target.getText(), pendingCode)) {
-                    // Paste did not land - write the text directly.
-                    setNodeText(target, pendingCode);
+                if (target != null) {
+                    if (!containsCode(target.getText(), pendingCode)) {
+                        // Paste did not land - write the text directly.
+                        setNodeText(target, pendingCode);
+                    }
+                    // ENTER
+                    target.performAction(ACTION_IME_ENTER);
                 }
-                final String code = pendingCode;
-                step = 0;
-                // Wait 1 second after pasting before finishing.
-                handler.postDelayed(new FinishRunnable(this, code), FINAL_WAIT_MS);
+                // Wait 1 second; any touch on the screen cancels the 配完 tap.
+                userTouched = false;
+                addTouchWatcher();
+                next(STEP_WAIT, FINAL_WAIT_MS);
+                break;
+            }
+            case STEP_WAIT: {
+                removeTouchWatcher();
+                if (userTouched) {
+                    cancelFlow();
+                    showToast("Colado: " + pendingCode + " (toque detectado, 配完 não clicado)");
+                } else {
+                    next(STEP_COMPLETE, 0);
+                }
+                break;
+            }
+            case STEP_COMPLETE: {
+                AccessibilityNodeInfo node = findBestByText(root, TEXT_COMPLETE);
+                if (node == null) {
+                    node = findBestByText(root, TEXT_COMPLETE_LONG);
+                }
+                if (node != null && click(node)) {
+                    String code = pendingCode;
+                    cancelFlow();
+                    showToast("Colado: " + code + " → 配完");
+                } else {
+                    retry();
+                }
                 break;
             }
             default:
                 flowRunning = false;
                 break;
-        }
-    }
-
-    void finishFlow(String code) {
-        if (flowRunning) {
-            flowRunning = false;
-            showToast("Colado: " + code);
         }
     }
 
@@ -315,7 +361,7 @@ public final class CodeCatcherService extends AccessibilityService {
      * Finds the 伝票番号を入力 field: an editable node whose hint/text/description
      * matches, or the editable node next to a label with that text.
      */
-    private static AccessibilityNodeInfo findInputField(AccessibilityNodeInfo root) {
+    private AccessibilityNodeInfo findInputField(AccessibilityNodeInfo root) {
         List<AccessibilityNodeInfo> editables = new ArrayList<>();
         collectEditables(root, editables, 0);
         for (AccessibilityNodeInfo e : editables) {
@@ -374,19 +420,51 @@ public final class CodeCatcherService extends AccessibilityService {
     }
 
     /** Prefers an exact text match, then the shortest text containing the search. */
-    static AccessibilityNodeInfo findBestByText(AccessibilityNodeInfo root, String search) {
+    private AccessibilityNodeInfo findBestByText(AccessibilityNodeInfo root, String search) {
         List<AccessibilityNodeInfo> found = new ArrayList<>();
         collectMatches(root, search, found, 0);
+        if (found.isEmpty()) {
+            // Active window may not be the app (e.g. focus elsewhere): scan app windows.
+            for (AccessibilityNodeInfo r : appWindowRoots()) {
+                collectMatches(r, search, found, 0);
+            }
+        }
         AccessibilityNodeInfo best = null;
-        int bestLen = Integer.MAX_VALUE;
+        int bestScore = Integer.MAX_VALUE;
         for (AccessibilityNodeInfo n : found) {
-            int len = labelOf(n, search).trim().length();
-            if (len < bestLen) {
+            // Shortest label wins; on ties, a clickable button beats a plain title.
+            int score = labelOf(n, search).trim().length() * 2 + (clickableTarget(n) != null ? 0 : 1);
+            if (score < bestScore) {
                 best = n;
-                bestLen = len;
+                bestScore = score;
             }
         }
         return best;
+    }
+
+    private List<AccessibilityNodeInfo> appWindowRoots() {
+        List<AccessibilityNodeInfo> roots = new ArrayList<>();
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                if (w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    AccessibilityNodeInfo r = w.getRoot();
+                    if (r != null) {
+                        roots.add(r);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return roots;
+    }
+
+    private static AccessibilityNodeInfo clickableTarget(AccessibilityNodeInfo node) {
+        for (AccessibilityNodeInfo p = node; p != null; p = p.getParent()) {
+            if (p.isClickable() && p.isEnabled()) {
+                return p;
+            }
+        }
+        return null;
     }
 
     private static String labelOf(AccessibilityNodeInfo n, String search) {
@@ -415,17 +493,13 @@ public final class CodeCatcherService extends AccessibilityService {
         }
     }
 
-    /** Clicks the node or its nearest clickable ancestor; falls back to a tap gesture. */
+    /** Taps the node like a finger; falls back to ACTION_CLICK on its clickable ancestor. */
     private boolean click(AccessibilityNodeInfo node) {
-        for (AccessibilityNodeInfo p = node; p != null; p = p.getParent()) {
-            if (p.isClickable() && p.isEnabled()) {
-                if (p.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                    return true;
-                }
-                break;
-            }
+        if (tap(node)) {
+            return true;
         }
-        return tap(node);
+        AccessibilityNodeInfo target = clickableTarget(node);
+        return target != null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     private boolean focusField(AccessibilityNodeInfo field) {
@@ -436,13 +510,13 @@ public final class CodeCatcherService extends AccessibilityService {
                 return true;
             }
         }
-        return click(field);
+        return tap(field);
     }
 
     private boolean tap(AccessibilityNodeInfo node) {
         Rect r = new Rect();
         node.getBoundsInScreen(r);
-        if (r.isEmpty()) {
+        if (r.isEmpty() || r.right <= 0 || r.bottom <= 0) {
             return false;
         }
         Path path = new Path();
@@ -469,13 +543,49 @@ public final class CodeCatcherService extends AccessibilityService {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
 
+    private void addTouchWatcher() {
+        removeTouchWatcher();
+        try {
+            View v = new View(this);
+            v.setOnTouchListener(new TouchWatcher(this));
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(1, 1,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                            | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+                    PixelFormat.TRANSLUCENT);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            ((WindowManager) getSystemService(WINDOW_SERVICE)).addView(v, lp);
+            touchView = v;
+        } catch (Exception ignored) {
+            touchView = null;
+        }
+    }
+
+    private void removeTouchWatcher() {
+        if (touchView != null) {
+            try {
+                ((WindowManager) getSystemService(WINDOW_SERVICE)).removeView(touchView);
+            } catch (Exception ignored) {
+            }
+            touchView = null;
+        }
+    }
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (step == STEP_WAIT && event != null) {
+            int t = event.getEventType();
+            if (t == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START
+                    || t == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+                userTouched = true;
+            }
+        }
     }
 
     @Override
     public void onInterrupt() {
-        cancelFlow();
+        // Must not cancel the auto paste flow: the system calls this on its own.
     }
 
     @Override
